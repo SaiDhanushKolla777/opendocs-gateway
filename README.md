@@ -253,6 +253,18 @@ All settings are controlled through environment variables (see `.env.example`):
 
 ---
 
+
+## Screenshot
+
+<img width="2499" height="1296" alt="image" src="https://github.com/user-attachments/assets/742f9e0c-43cb-48ab-98c0-093cae9856eb" />
+
+
+<img width="2447" height="1286" alt="image" src="https://github.com/user-attachments/assets/fa101244-ed08-402b-ae6a-e8be47a1793d" />
+
+
+<img width="2535" height="1242" alt="image" src="https://github.com/user-attachments/assets/af89a8f7-086b-446a-850d-bae40735b03f" />
+
+
 ## Current limitations
 
 - **Retrieval is keyword-based.** No vector embeddings or semantic search yet. Works well for specific queries and proper nouns, less well for abstract or paraphrased questions. A vector store or reranker would improve this.
@@ -272,3 +284,6 @@ All settings are controlled through environment variables (see `.env.example`):
 - Redis for caching LLM responses to repeated queries
 - Authentication and API key management
 - PostgreSQL for multi-user deployments
+
+
+
