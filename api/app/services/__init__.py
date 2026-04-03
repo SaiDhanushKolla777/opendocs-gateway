@@ -10,6 +10,7 @@ from .retrieval_service import (
     format_context_with_labels,
     score_chunks,
     select_top_chunks,
+    tfidf_scores_parallel,
 )
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "ingest_document",
     "document_to_chunks",
     "score_chunks",
+    "tfidf_scores_parallel",
     "select_top_chunks",
     "chunks_to_citations",
     "format_context_with_labels",

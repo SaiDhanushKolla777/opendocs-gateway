@@ -32,3 +32,5 @@ class Chunk(BaseModel):
     char_length: int
     source_filename: str
     upload_timestamp: Optional[datetime] = None
+    # Serialized float32 L2-normalized embedding (internal; not exposed in API responses)
+    embedding: Optional[bytes] = Field(default=None, repr=False)

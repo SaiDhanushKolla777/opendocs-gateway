@@ -6,6 +6,26 @@ The backend talks to a vLLM server running an open-weight model (we used Qwen2.5
 
 ---
 
+## What makes this different
+
+Most RAG applications follow a standard pattern: chunk, embed, vector store, retrieve, generate. OpenDocs Gateway makes several design choices that diverge from the norm:
+
+**Hybrid retrieval without a vector database.** Dense embeddings (sentence-transformers) are fused with TF-IDF scoring using Reciprocal Rank Fusion — the same technique used by Elasticsearch and state-of-the-art IR systems. Embeddings are stored as raw BLOBs in the same SQLite table as the chunks. No FAISS, no ChromaDB, no Pinecone, no separate vector store. For document-scale workloads (hundreds of chunks, not millions), this is faster than any external vector DB because it eliminates serialization and network overhead.
+
+**Citations reflect what the LLM actually used, not just what matched the query.** After the LLM generates an answer, all context chunks are re-ranked by their overlap with the answer text. A chunk that scored high on retrieval but wasn't drawn from in the response gets demoted. This two-stage pipeline (retrieve → generate → re-cite) is uncommon — most systems attach citations based solely on the retrieval step.
+
+**Intent classification without an LLM call.** Every incoming message is classified as a new question, a follow-up, or conversational filler using pure word-set analysis — no extra model inference. When a user says "thanks", the system skips chunk scoring, embedding lookups, and context assembly entirely, responding with just a lightweight LLM call (100 tokens, no retrieval). This saves meaningful GPU time in real conversations.
+
+**Retrieval queries are enriched from conversation history.** When a follow-up is detected, the search query is augmented with terms from prior substantive user messages. So "tell me more" doesn't search for the word "more" — it searches for what was discussed in previous turns.
+
+**Extraction schemas are generated per-document.** Instead of hardcoded templates, a first LLM pass reads sampled chunks to detect the document type and generate an appropriate extraction schema. A novel gets characters, themes, plot structure. A contract gets parties, dates, obligations. A research paper gets methodology, findings, conclusions. No configuration needed.
+
+**Comparison adapts to document relationships.** Text fingerprinting and title matching detect whether two documents are identical, versions of each other, or completely different — then a different prompt runs for each case. Identical documents are caught instantly without an LLM call.
+
+**Zero-infrastructure deployment.** One SQLite file, one filesystem directory, one GPU. No Redis, no PostgreSQL, no message queue, no vector store service. The entire backend is a single Python process.
+
+---
+
 ## What it does
 
 ### Grounded Q&A
@@ -40,27 +60,37 @@ Tracks request count, latency percentiles (P50/P95/P99), average input and outpu
 
 ## How the retrieval works
 
-This doesn't use vector embeddings or a vector database. The retrieval pipeline is keyword-based but goes well beyond simple word matching:
+The retrieval pipeline combines dense semantic embeddings with keyword-based scoring via hybrid fusion:
 
-1. **TF-IDF-style scoring** — Each chunk is scored against the query using term frequency weighted by inverse document frequency across all chunks. This prevents common words from dominating.
+### Dual scoring
 
-2. **Proper noun boosting** — Capitalized words in the query (names, places) get 2.5x weight. When you ask about "Elizabeth Bennet", chunks mentioning her rank much higher.
+Each chunk is scored by two independent signals:
 
-3. **Bigram matching** — Adjacent query terms are checked as phrases. "design principles" as a bigram scores higher than chunks that just happen to contain "design" and "principles" separately.
+1. **Dense semantic similarity** — Chunks are embedded at upload time using sentence-transformers (`all-MiniLM-L6-v2` by default). At query time, the query is embedded and scored against every chunk via cosine similarity. This captures meaning: "What is the protagonist's flaw?" matches chunks about character weaknesses even if the word "flaw" never appears.
 
-4. **Stopword filtering** — A large set of common English words is excluded from scoring so retrieval focuses on the terms that actually matter.
+2. **TF-IDF-style lexical scoring** — Term frequency weighted by inverse document frequency, with proper noun boosting (2.5x weight for capitalized words like names and places), bigram phrase matching, and stopword filtering. This captures precision: when you ask about "Elizabeth Bennet", chunks containing her name rank high regardless of semantic distance.
 
-5. **Neighbor chunk expansion** — After selecting the top chunks, the system also pulls in adjacent chunks (the one before and after each selected chunk). This gives the LLM more continuous context rather than isolated fragments.
+### Fusion
 
-6. **Answer-based citation re-ranking** — After the LLM generates its answer, the system re-ranks all context chunks by how much they overlap with the actual answer text. This means the citations you see are the ones that genuinely supported what the LLM said, not just the ones that matched the query keywords.
+The two score lists are merged using **Reciprocal Rank Fusion** (RRF): each chunk gets `1/(k + rank_tfidf) + 1/(k + rank_semantic)` where `k=60`. RRF is robust — it doesn't need careful weight tuning and handles the different score distributions of lexical and semantic systems naturally. A weighted linear blend mode is also available via configuration.
 
-The retrieval settings (number of chunks, context budget, token limits) are all configurable through environment variables.
+### Post-retrieval pipeline
+
+3. **Neighbor chunk expansion** — After selecting the top chunks, the system pulls in adjacent chunks (the one before and after each selected chunk). This gives the LLM continuous passages rather than isolated fragments.
+
+4. **Answer-based citation re-ranking** — After the LLM generates its answer, all context chunks are re-ranked by how much they overlap with the actual answer text (token overlap + bigram phrase bonus). The citations you see are the ones that genuinely supported what the LLM said, not just the ones that matched the query.
+
+### Graceful degradation
+
+If `sentence-transformers` is not installed or embeddings are missing for a document, the system falls back to TF-IDF-only scoring automatically. Embeddings for older documents (uploaded before RAG was enabled) are backfilled on the first query.
+
+The retrieval settings (number of chunks, context budget, token limits, fusion mode, weights) are all configurable through environment variables.
 
 ---
 
 ## How conversation works
 
-The system classifies every incoming message into one of three intents:
+The system classifies every incoming message into one of three intents — without making an LLM call:
 
 - **New question** — Contains substantive words or question words. Gets full retrieval and LLM processing.
 - **Follow-up** — Short message with referential words ("more detail", "why", "how about") and there's conversation history. The search query is enriched with terms from recent questions so retrieval stays relevant to the thread. The LLM prompt tells it to expand with new information, not repeat itself.
@@ -91,11 +121,12 @@ opendocs-gateway/
 │   │   │   └── reports.py        # Report generation
 │   │   ├── services/             # Business logic
 │   │   │   ├── comparison_service.py   # Mode-aware doc comparison
+│   │   │   ├── embedding_service.py    # Dense embeddings (sentence-transformers)
 │   │   │   ├── extraction_service.py   # Adaptive schema detection + extraction
-│   │   │   ├── ingestion_service.py    # Text extraction, chunking
+│   │   │   ├── ingestion_service.py    # Text extraction, chunking, embedding
 │   │   │   ├── llm_service.py          # vLLM client (OpenAI SDK)
 │   │   │   ├── metrics_service.py      # In-memory metrics tracking
-│   │   │   └── retrieval_service.py    # Scoring, selection, re-ranking, citations
+│   │   │   └── retrieval_service.py    # Hybrid scoring, fusion, re-ranking, citations
 │   │   └── utils/                # Prompts, token budgeting, validation
 │   └── requirements.txt
 ├── frontend/                     # Next.js 14 (App Router)
@@ -116,10 +147,11 @@ opendocs-gateway/
 | Layer | Technology |
 |-------|-----------|
 | Backend | Python 3.11+, FastAPI, Uvicorn, SQLAlchemy, Pydantic |
+| Embeddings | sentence-transformers (all-MiniLM-L6-v2), NumPy |
 | Frontend | Next.js 14, React 18, TypeScript, Tailwind CSS |
 | LLM serving | vLLM (any OpenAI-compatible endpoint) |
 | Model | Qwen/Qwen2.5-7B-Instruct (or any model your vLLM serves) |
-| Database | SQLite (documents + chunk metadata) |
+| Database | SQLite (documents + chunks + embeddings) |
 | File storage | Local filesystem |
 | GPU | AMD Instinct MI300X (192GB HBM3) |
 
@@ -250,6 +282,12 @@ All settings are controlled through environment variables (see `.env.example`):
 | `MAX_COMPARE_CONTEXT_CHARS` | `24000` | Character budget for comparison |
 | `MAX_MULTI_DOCS` | `5` | Max documents in multi-doc query |
 | `MAX_UPLOAD_MB` | `50` | Max upload file size |
+| `RAG_ENABLED` | `true` | Enable hybrid dense+TF-IDF retrieval |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model |
+| `RAG_FUSION_MODE` | `rrf` | Fusion strategy: `rrf` or `weighted` |
+| `RAG_SEMANTIC_WEIGHT` | `0.55` | Semantic weight (weighted mode only) |
+| `RAG_TFIDF_WEIGHT` | `0.45` | TF-IDF weight (weighted mode only) |
+| `RRF_K` | `60` | RRF constant (higher = more uniform blending) |
 
 ---
 
@@ -267,18 +305,18 @@ All settings are controlled through environment variables (see `.env.example`):
 
 ## Current limitations
 
-- **Retrieval is keyword-based.** No vector embeddings or semantic search yet. Works well for specific queries and proper nouns, less well for abstract or paraphrased questions. A vector store or reranker would improve this.
 - **Single vLLM endpoint.** The system talks to one model endpoint. No multi-model routing or fallbacks.
 - **SQLite only.** Fine for single-user or small team usage. Would need PostgreSQL for production multi-user deployments.
 - **Metrics are in-memory.** They reset when the backend restarts. No persistent metrics storage.
 - **No authentication.** Anyone with access to the URL can use the system. Add a reverse proxy or API key middleware for production.
+- **No ANN index.** Semantic scoring iterates over all chunk embeddings linearly. This is fast for document-scale workloads (hundreds of chunks) but would need an ANN index (FAISS, HNSW) for corpus-scale search (millions of chunks).
 
 ---
 
 ## What could be added next
 
-- Vector search with FAISS or ChromaDB for semantic retrieval
-- Reranker model as a second scoring pass
+- ANN index (FAISS/HNSW) for corpus-scale semantic search
+- Reranker model (cross-encoder) as a third scoring pass after fusion
 - Streaming responses (SSE) for real-time token output in the chat UI
 - PDF report export from the reports feature
 - Redis for caching LLM responses to repeated queries

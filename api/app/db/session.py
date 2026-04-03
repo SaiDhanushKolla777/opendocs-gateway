@@ -1,7 +1,7 @@
 """Database session and engine (SQLite for v1)."""
 from __future__ import annotations
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
@@ -10,6 +10,18 @@ from app.db import models  # noqa: F401 - register models with Base
 # Engine created lazily from config
 _engine = None
 _SessionLocal = None
+
+
+def _migrate_sqlite_chunks_embedding(engine) -> None:
+    """Add embedding column to existing SQLite DBs if missing."""
+    if "sqlite" not in str(engine.url):
+        return
+    with engine.connect() as conn:
+        rows = conn.execute(text("PRAGMA table_info(chunks)")).fetchall()
+        col_names = {row[1] for row in rows}
+        if "embedding" not in col_names:
+            conn.execute(text("ALTER TABLE chunks ADD COLUMN embedding BLOB"))
+            conn.commit()
 
 
 def get_engine(database_url: str):
@@ -25,6 +37,7 @@ def get_engine(database_url: str):
             connect_args={"check_same_thread": False} if "sqlite" in database_url else {},
         )
         Base.metadata.create_all(bind=_engine)
+        _migrate_sqlite_chunks_embedding(_engine)
     return _engine
 
 

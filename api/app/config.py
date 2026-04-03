@@ -39,6 +39,17 @@ class Settings(BaseSettings):
     default_long_context_mode: bool = Field(default=False, alias="DEFAULT_LONG_CONTEXT_MODE")
     max_concurrent_requests: int = Field(default=4, alias="MAX_CONCURRENT_REQUESTS")
 
+    # Hybrid RAG: dense embeddings + TF-IDF (reciprocal rank fusion or weighted blend)
+    rag_enabled: bool = Field(default=True, alias="RAG_ENABLED")
+    embedding_model: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        alias="EMBEDDING_MODEL",
+    )
+    rag_fusion_mode: str = Field(default="rrf", alias="RAG_FUSION_MODE")  # "rrf" | "weighted"
+    rag_semantic_weight: float = Field(default=0.55, alias="RAG_SEMANTIC_WEIGHT")
+    rag_tfidf_weight: float = Field(default=0.45, alias="RAG_TFIDF_WEIGHT")
+    rrf_k: int = Field(default=60, alias="RRF_K")
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
 

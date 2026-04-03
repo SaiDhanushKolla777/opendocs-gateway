@@ -1,12 +1,17 @@
-"""Retrieval: chunk scoring, context assembly, citation building (v1.1 improved)."""
+"""Retrieval: hybrid RAG (dense embeddings) + TF-IDF fusion, context assembly, citations."""
 from __future__ import annotations
 
+import logging
 import math
 import re
 from collections import Counter
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
+from app.config import get_settings
 from app.models import Citation, Chunk
+from app.services.embedding_service import embedding_available, semantic_similarity_scores
+
+logger = logging.getLogger(__name__)
 
 STOP_WORDS = frozenset({
     "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to",
@@ -43,12 +48,14 @@ def _extract_query_terms(query: str) -> Tuple[List[str], List[str]]:
     return terms, important
 
 
-def score_chunks(query: str, chunks: List[Chunk]) -> List[Tuple[Chunk, float]]:
-    """Score chunks using TF-IDF-like weighting with proper noun boosting."""
+def tfidf_scores_parallel(query: str, chunks: List[Chunk]) -> List[float]:
+    """One TF-IDF-style score per chunk (same order as ``chunks``)."""
     terms, important_terms = _extract_query_terms(query)
+    if not chunks:
+        return []
 
     if not terms and not important_terms:
-        return [(c, 0.0) for c in chunks]
+        return [0.0] * len(chunks)
 
     num_chunks = len(chunks)
     doc_freq: Counter = Counter()
@@ -63,7 +70,7 @@ def score_chunks(query: str, chunks: List[Chunk]) -> List[Tuple[Chunk, float]]:
         df = doc_freq.get(t, 0)
         idf[t] = math.log((num_chunks + 1) / (df + 1)) + 1.0
 
-    scored: List[Tuple[Chunk, float]] = []
+    scores: List[float] = []
     for c in chunks:
         text_lower = c.text.lower()
         text_tokens = _tokenize(c.text)
@@ -85,10 +92,9 @@ def score_chunks(query: str, chunks: List[Chunk]) -> List[Tuple[Chunk, float]]:
                 if b in text_lower:
                     score += 1.5
 
-        scored.append((c, score))
+        scores.append(score)
 
-    scored.sort(key=lambda x: -x[1])
-    return scored
+    return scores
 
 
 def _make_bigrams(terms: List[str]) -> List[str]:
@@ -97,16 +103,121 @@ def _make_bigrams(terms: List[str]) -> List[str]:
     return [f"{terms[i]} {terms[i+1]}" for i in range(len(terms) - 1)]
 
 
+def _rank_map_from_scores(chunks: List[Chunk], scores: List[float]) -> Dict[str, int]:
+    """1-based rank (1 = best) for each chunk_id."""
+    order = sorted(range(len(chunks)), key=lambda i: -scores[i])
+    return {chunks[idx].chunk_id: pos + 1 for pos, idx in enumerate(order)}
+
+
+def _min_max_norm(scores: List[float]) -> List[float]:
+    if not scores:
+        return []
+    lo, hi = min(scores), max(scores)
+    if hi - lo < 1e-12:
+        return [1.0] * len(scores)
+    return [(x - lo) / (hi - lo) for x in scores]
+
+
+def _hybrid_rrf(
+    chunks: List[Chunk],
+    tfidf_scores: List[float],
+    sem_scores: List[float],
+    k: int,
+) -> List[Tuple[Chunk, float]]:
+    """Reciprocal Rank Fusion: robust merge of lexical and semantic rankings."""
+    r_tfidf = _rank_map_from_scores(chunks, tfidf_scores)
+    r_sem = _rank_map_from_scores(chunks, sem_scores)
+    fused: List[Tuple[Chunk, float]] = []
+    for c in chunks:
+        cid = c.chunk_id
+        fused.append(
+            (
+                c,
+                1.0 / (k + r_tfidf[cid]) + 1.0 / (k + r_sem[cid]),
+            )
+        )
+    fused.sort(key=lambda x: -x[1])
+    return fused
+
+
+def _hybrid_weighted(
+    chunks: List[Chunk],
+    tfidf_scores: List[float],
+    sem_scores: List[float],
+    w_sem: float,
+    w_tfidf: float,
+) -> List[Tuple[Chunk, float]]:
+    """Min–max normalize both signals and blend (complements RRF)."""
+    n_t = _min_max_norm(tfidf_scores)
+    n_s = _min_max_norm(sem_scores)
+    w = w_sem + w_tfidf
+    a = (w_sem / w) if w > 0 else 0.5
+    b = (w_tfidf / w) if w > 0 else 0.5
+    fused = [
+        (chunks[i], a * n_s[i] + b * n_t[i])
+        for i in range(len(chunks))
+    ]
+    fused.sort(key=lambda x: -x[1])
+    return fused
+
+
+def score_chunks(query: str, chunks: List[Chunk]) -> List[Tuple[Chunk, float]]:
+    """Hybrid RAG + TF-IDF when enabled and embeddings exist; else TF-IDF only.
+
+    Uses reciprocal rank fusion (default) or weighted blend of normalized scores.
+    """
+    s = get_settings()
+    tfidf = tfidf_scores_parallel(query, chunks)
+    if not chunks:
+        return []
+
+    use_rag = (
+        s.rag_enabled
+        and embedding_available()
+        and all(c.embedding is not None for c in chunks)
+    )
+
+    if not use_rag:
+        scored = list(zip(chunks, tfidf))
+        scored.sort(key=lambda x: -x[1])
+        return scored
+
+    try:
+        sem = semantic_similarity_scores(query, chunks)
+    except Exception as e:
+        logger.warning("Semantic scoring failed; using TF-IDF only: %s", e)
+        scored = list(zip(chunks, tfidf))
+        scored.sort(key=lambda x: -x[1])
+        return scored
+
+    mode = (s.rag_fusion_mode or "rrf").strip().lower()
+    if mode == "weighted":
+        return _hybrid_weighted(
+            chunks, tfidf, sem,
+            s.rag_semantic_weight, s.rag_tfidf_weight,
+        )
+    return _hybrid_rrf(chunks, tfidf, sem, s.rrf_k)
+
+
 def select_top_chunks(
     scored: List[Tuple[Chunk, float]],
     max_chunks: int,
     min_score: float = 0.01,
 ) -> List[Chunk]:
-    """Select top-scoring chunks, filtering near-zero scores."""
+    """Select top-scoring chunks, filtering near-zero scores.
+
+    RRF scores are small (~0.03); TF-IDF scores are often larger. Use a relative
+    cutoff for small magnitudes and keep the legacy absolute floor for strong
+    lexical scores only.
+    """
     if not scored:
         return []
-    top_score = scored[0][1] if scored else 0
-    threshold = max(min_score, top_score * 0.15)
+    top_score = scored[0][1]
+    rel = abs(top_score) * 0.15
+    if abs(top_score) >= 0.25:
+        threshold = max(min_score, rel)
+    else:
+        threshold = max(rel, 1e-12)
     selected = [c for c, s in scored if s >= threshold][:max_chunks]
     if not selected and scored:
         selected = [scored[0][0]]
@@ -185,7 +296,6 @@ def rerank_by_answer(chunks: List[Chunk], answer: str, top_k: int = 6) -> List[C
         overlap = len(answer_tokens & chunk_tokens)
         unique_overlap = len((answer_tokens & chunk_tokens) - STOP_WORDS)
         phrase_bonus = 0.0
-        answer_lower = answer.lower()
         words = list(answer_tokens)[:20]
         for i in range(len(words) - 1):
             bigram = f"{words[i]} {words[i+1]}"

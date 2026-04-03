@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.db.repositories import create_chunks_batch, create_document, get_chunks_by_document
+from app.services.embedding_service import embed_document_chunks
 from app.db.models import DocumentModel
 from app.models import Chunk
 from app.utils.file_utils import unique_chunk_id, unique_document_id
@@ -116,6 +117,7 @@ def ingest_document(
         for i, (text, page_num) in enumerate(raw_chunks)
     ]
     create_chunks_batch(db, batch)
+    embed_document_chunks(db, doc_id)
     return doc
 
 
@@ -133,6 +135,7 @@ def document_to_chunks(db: Session, document_id: str) -> List[Chunk]:
             char_length=r.char_length,
             source_filename=r.source_filename,
             upload_timestamp=r.upload_timestamp,
+            embedding=r.embedding,
         )
         for r in rows
     ]

@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, DateTime, Integer, String, Text
+from sqlalchemy import Column, DateTime, Integer, LargeBinary, String, Text
 
 from app.db.base import Base
 
@@ -37,3 +37,5 @@ class ChunkModel(Base):
     char_length = Column(Integer, nullable=False)
     source_filename = Column(String(512), nullable=False)
     upload_timestamp = Column(DateTime, nullable=True)
+    # L2-normalized float32 vector (sentence-transformers), for hybrid RAG retrieval
+    embedding = Column(LargeBinary, nullable=True)

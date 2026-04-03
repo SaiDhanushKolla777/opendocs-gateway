@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -110,3 +110,15 @@ def get_chunks_by_ids(db: Session, chunk_ids: List[str]) -> List[ChunkModel]:
     if not chunk_ids:
         return []
     return db.query(ChunkModel).filter(ChunkModel.id.in_(chunk_ids)).all()
+
+
+def update_chunk_embeddings_batch(db: Session, updates: List[Tuple[str, bytes]]) -> None:
+    """Persist float32 embedding blobs for chunks. Each item is (chunk_id, embedding_bytes)."""
+    if not updates:
+        return
+    for chunk_id, emb in updates:
+        db.query(ChunkModel).filter(ChunkModel.id == chunk_id).update(
+            {"embedding": emb},
+            synchronize_session=False,
+        )
+    db.commit()

@@ -12,6 +12,7 @@ from app.dependencies import get_db_gen
 from app.models import AskRequest, AskResponse, AskMultiRequest, AskMultiResponse
 from app.db.repositories import get_document
 from app.services.ingestion_service import document_to_chunks
+from app.services.embedding_service import ensure_chunk_embeddings
 from app.services.retrieval_service import (
     score_chunks,
     select_top_chunks,
@@ -190,6 +191,8 @@ async def ask(
     if not all_chunks:
         raise HTTPException(400, "Document has no chunks (ingestion may have failed)")
     s = get_settings()
+    if s.rag_enabled:
+        ensure_chunk_embeddings(db, all_chunks)
     max_cite = min(body.max_citations or s.max_retrieved_chunks, s.max_retrieved_chunks)
 
     search_query = _build_search_query(body.question, body.history, intent)
@@ -249,6 +252,9 @@ async def ask_multi(
         all_chunks.extend(doc_chunks)
     if not all_chunks:
         raise HTTPException(400, "No chunks found for the selected documents")
+
+    if s.rag_enabled:
+        ensure_chunk_embeddings(db, all_chunks)
 
     num_docs = len(body.document_ids)
     per_doc = max(2, s.max_retrieved_chunks // num_docs)
