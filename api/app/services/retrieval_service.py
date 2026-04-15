@@ -1,15 +1,19 @@
-"""Retrieval: hybrid RAG (dense embeddings) + TF-IDF fusion, context assembly, citations."""
+"""Retrieval: hybrid RAG (dense embeddings + FAISS ANN) + TF-IDF fusion, context assembly, citations."""
 from __future__ import annotations
 
 import logging
 import math
 import re
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from app.config import get_settings
 from app.models import Citation, Chunk
-from app.services.embedding_service import embedding_available, semantic_similarity_scores
+from app.services.embedding_service import (
+    embedding_available,
+    encode_query,
+    semantic_similarity_scores,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -161,9 +165,50 @@ def _hybrid_weighted(
     return fused
 
 
+def _faiss_semantic_scores(
+    query: str,
+    chunks: List[Chunk],
+) -> Optional[List[float]]:
+    """Use FAISS ANN index to compute semantic similarity scores.
+
+    Returns a list of scores aligned with ``chunks`` (same order), or None
+    if FAISS is unavailable or no index exists for the relevant documents.
+    """
+    try:
+        from app.services.faiss_index import faiss_available, search_document
+    except ImportError:
+        return None
+
+    s = get_settings()
+    if not s.faiss_enabled or not faiss_available():
+        return None
+
+    doc_ids = list({c.document_id for c in chunks})
+
+    try:
+        q_vec = encode_query(query)
+    except Exception:
+        return None
+
+    faiss_hits: Dict[str, float] = {}
+    for doc_id in doc_ids:
+        results = search_document(doc_id, q_vec, top_k=len(chunks))
+        if results is None:
+            return None
+        for chunk_id, score in results:
+            faiss_hits[chunk_id] = score
+
+    scores: List[float] = []
+    for c in chunks:
+        scores.append(faiss_hits.get(c.chunk_id, -1.0))
+    return scores
+
+
 def score_chunks(query: str, chunks: List[Chunk]) -> List[Tuple[Chunk, float]]:
     """Hybrid RAG + TF-IDF when enabled and embeddings exist; else TF-IDF only.
 
+    When FAISS is available, uses ANN index for fast semantic search instead of
+    brute-force dot products. Falls back to brute-force or TF-IDF-only as needed.
     Uses reciprocal rank fusion (default) or weighted blend of normalized scores.
     """
     s = get_settings()
@@ -182,13 +227,24 @@ def score_chunks(query: str, chunks: List[Chunk]) -> List[Tuple[Chunk, float]]:
         scored.sort(key=lambda x: -x[1])
         return scored
 
-    try:
-        sem = semantic_similarity_scores(query, chunks)
-    except Exception as e:
-        logger.warning("Semantic scoring failed; using TF-IDF only: %s", e)
-        scored = list(zip(chunks, tfidf))
-        scored.sort(key=lambda x: -x[1])
-        return scored
+    sem = None
+    if s.faiss_enabled:
+        try:
+            sem = _faiss_semantic_scores(query, chunks)
+            if sem is not None:
+                logger.debug("Using FAISS ANN for semantic scoring (%d chunks)", len(chunks))
+        except Exception as e:
+            logger.debug("FAISS scoring unavailable, falling back: %s", e)
+            sem = None
+
+    if sem is None:
+        try:
+            sem = semantic_similarity_scores(query, chunks)
+        except Exception as e:
+            logger.warning("Semantic scoring failed; using TF-IDF only: %s", e)
+            scored = list(zip(chunks, tfidf))
+            scored.sort(key=lambda x: -x[1])
+            return scored
 
     mode = (s.rag_fusion_mode or "rrf").strip().lower()
     if mode == "weighted":

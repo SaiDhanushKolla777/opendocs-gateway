@@ -10,7 +10,7 @@ The backend talks to a vLLM server running an open-weight model (we used Qwen2.5
 
 Most RAG applications follow a standard pattern: chunk, embed, vector store, retrieve, generate. OpenDocs Gateway makes several design choices that diverge from the norm:
 
-**Hybrid retrieval without a vector database.** Dense embeddings (sentence-transformers) are fused with TF-IDF scoring using Reciprocal Rank Fusion — the same technique used by Elasticsearch and state-of-the-art IR systems. Embeddings are stored as raw BLOBs in the same SQLite table as the chunks. No FAISS, no ChromaDB, no Pinecone, no separate vector store. For document-scale workloads (hundreds of chunks, not millions), this is faster than any external vector DB because it eliminates serialization and network overhead.
+**Hybrid retrieval with optional FAISS ANN indexing.** Dense embeddings (sentence-transformers) are fused with TF-IDF scoring using Reciprocal Rank Fusion — the same technique used by Elasticsearch and state-of-the-art IR systems. Embeddings are stored as raw BLOBs in the same SQLite table as the chunks. No ChromaDB, no Pinecone, no separate vector store. For document-scale workloads, brute-force scoring is used automatically. For corpus-scale workloads (thousands to millions of chunks), FAISS HNSW indexes are built per-document at ingest time and used for sub-linear approximate nearest neighbor search. The system selects the right strategy automatically and falls back gracefully.
 
 **Citations reflect what the LLM actually used, not just what matched the query.** After the LLM generates an answer, all context chunks are re-ranked by their overlap with the answer text. A chunk that scored high on retrieval but wasn't drawn from in the response gets demoted. This two-stage pipeline (retrieve → generate → re-cite) is uncommon — most systems attach citations based solely on the retrieval step.
 
@@ -22,7 +22,7 @@ Most RAG applications follow a standard pattern: chunk, embed, vector store, ret
 
 **Comparison adapts to document relationships.** Text fingerprinting and title matching detect whether two documents are identical, versions of each other, or completely different — then a different prompt runs for each case. Identical documents are caught instantly without an LLM call.
 
-**Zero-infrastructure deployment.** One SQLite file, one filesystem directory, one GPU. No Redis, no PostgreSQL, no message queue, no vector store service. The entire backend is a single Python process.
+**Zero-infrastructure deployment.** One SQLite file, one filesystem directory, one GPU. No Redis, no PostgreSQL, no message queue, no external vector store service. FAISS indexes are persisted as flat files alongside the database. The entire backend is a single Python process.
 
 ---
 
@@ -70,6 +70,17 @@ Each chunk is scored by two independent signals:
 
 2. **TF-IDF-style lexical scoring** — Term frequency weighted by inverse document frequency, with proper noun boosting (2.5x weight for capitalized words like names and places), bigram phrase matching, and stopword filtering. This captures precision: when you ask about "Elizabeth Bennet", chunks containing her name rank high regardless of semantic distance.
 
+### FAISS ANN indexing
+
+When FAISS is enabled (default), a per-document ANN index is built automatically at ingest time alongside the embeddings. The system supports two index types:
+
+- **HNSW (Hierarchical Navigable Small World)** — Used by default for documents with 16+ chunks. Provides sub-linear search time with configurable build quality (`FAISS_HNSW_M`, `FAISS_HNSW_EF_CONSTRUCTION`) and query quality (`FAISS_HNSW_EF_SEARCH`). This is the same algorithm used by major vector databases internally.
+- **Flat (exact inner product)** — Used automatically for small documents where the overhead of building a graph isn't worth it. Gives exact results with zero approximation error.
+
+Indexes are persisted to disk as `.faiss` files and lazily loaded into an in-memory cache on first query. For multi-document queries, results from per-document indexes are merged and re-ranked.
+
+When FAISS is available, `score_chunks` uses the ANN index for the semantic scoring pass instead of brute-force dot products. This makes no difference for small documents but becomes critical at corpus scale — searching 100,000 chunks with HNSW takes milliseconds instead of seconds.
+
 ### Fusion
 
 The two score lists are merged using **Reciprocal Rank Fusion** (RRF): each chunk gets `1/(k + rank_tfidf) + 1/(k + rank_semantic)` where `k=60`. RRF is robust — it doesn't need careful weight tuning and handles the different score distributions of lexical and semantic systems naturally. A weighted linear blend mode is also available via configuration.
@@ -82,9 +93,15 @@ The two score lists are merged using **Reciprocal Rank Fusion** (RRF): each chun
 
 ### Graceful degradation
 
-If `sentence-transformers` is not installed or embeddings are missing for a document, the system falls back to TF-IDF-only scoring automatically. Embeddings for older documents (uploaded before RAG was enabled) are backfilled on the first query.
+The retrieval pipeline degrades gracefully through multiple fallback layers:
 
-The retrieval settings (number of chunks, context budget, token limits, fusion mode, weights) are all configurable through environment variables.
+1. If FAISS is available → uses ANN index for fast semantic scoring
+2. If FAISS is unavailable or no index exists → falls back to brute-force dot products
+3. If `sentence-transformers` is not installed or embeddings are missing → falls back to TF-IDF-only scoring
+
+Embeddings for older documents (uploaded before RAG was enabled) are backfilled on the first query, and their FAISS indexes are rebuilt at that time.
+
+The retrieval settings (number of chunks, context budget, token limits, fusion mode, weights, FAISS parameters) are all configurable through environment variables.
 
 ---
 
@@ -123,10 +140,11 @@ opendocs-gateway/
 │   │   │   ├── comparison_service.py   # Mode-aware doc comparison
 │   │   │   ├── embedding_service.py    # Dense embeddings (sentence-transformers)
 │   │   │   ├── extraction_service.py   # Adaptive schema detection + extraction
+│   │   │   ├── faiss_index.py          # FAISS ANN index management (HNSW/flat)
 │   │   │   ├── ingestion_service.py    # Text extraction, chunking, embedding
 │   │   │   ├── llm_service.py          # vLLM client (OpenAI SDK)
 │   │   │   ├── metrics_service.py      # In-memory metrics tracking
-│   │   │   └── retrieval_service.py    # Hybrid scoring, fusion, re-ranking, citations
+│   │   │   └── retrieval_service.py    # Hybrid scoring, FAISS ANN, fusion, re-ranking
 │   │   └── utils/                # Prompts, token budgeting, validation
 │   └── requirements.txt
 ├── frontend/                     # Next.js 14 (App Router)
@@ -148,11 +166,12 @@ opendocs-gateway/
 |-------|-----------|
 | Backend | Python 3.11+, FastAPI, Uvicorn, SQLAlchemy, Pydantic |
 | Embeddings | sentence-transformers (all-MiniLM-L6-v2), NumPy |
+| ANN Index | FAISS (HNSW or flat inner-product, per-document indexes) |
 | Frontend | Next.js 14, React 18, TypeScript, Tailwind CSS |
 | LLM serving | vLLM (any OpenAI-compatible endpoint) |
 | Model | Qwen/Qwen2.5-7B-Instruct (or any model your vLLM serves) |
 | Database | SQLite (documents + chunks + embeddings) |
-| File storage | Local filesystem |
+| File storage | Local filesystem (uploads + FAISS indexes) |
 | GPU | AMD Instinct MI300X (192GB HBM3) |
 
 ---
@@ -288,6 +307,13 @@ All settings are controlled through environment variables (see `.env.example`):
 | `RAG_SEMANTIC_WEIGHT` | `0.55` | Semantic weight (weighted mode only) |
 | `RAG_TFIDF_WEIGHT` | `0.45` | TF-IDF weight (weighted mode only) |
 | `RRF_K` | `60` | RRF constant (higher = more uniform blending) |
+| `FAISS_ENABLED` | `true` | Enable FAISS ANN indexing for semantic search |
+| `FAISS_INDEX_DIR` | `./data/faiss_indexes` | Directory for persisted FAISS index files |
+| `FAISS_USE_HNSW` | `true` | Use HNSW (approximate) vs flat (exact) indexes |
+| `FAISS_HNSW_M` | `32` | HNSW graph connectivity (higher = better recall, more memory) |
+| `FAISS_HNSW_EF_CONSTRUCTION` | `64` | HNSW build-time quality (higher = slower build, better index) |
+| `FAISS_HNSW_EF_SEARCH` | `32` | HNSW query-time quality (higher = slower search, better recall) |
+| `FAISS_NPROBE` | `8` | IVF probe count (for future IVF index support) |
 
 ---
 
@@ -309,13 +335,11 @@ All settings are controlled through environment variables (see `.env.example`):
 - **SQLite only.** Fine for single-user or small team usage. Would need PostgreSQL for production multi-user deployments.
 - **Metrics are in-memory.** They reset when the backend restarts. No persistent metrics storage.
 - **No authentication.** Anyone with access to the URL can use the system. Add a reverse proxy or API key middleware for production.
-- **No ANN index.** Semantic scoring iterates over all chunk embeddings linearly. This is fast for document-scale workloads (hundreds of chunks) but would need an ANN index (FAISS, HNSW) for corpus-scale search (millions of chunks).
 
 ---
 
 ## What could be added next
 
-- ANN index (FAISS/HNSW) for corpus-scale semantic search
 - Reranker model (cross-encoder) as a third scoring pass after fusion
 - Streaming responses (SSE) for real-time token output in the chat UI
 - PDF report export from the reports feature

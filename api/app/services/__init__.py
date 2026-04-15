@@ -1,6 +1,14 @@
 """Services."""
 from .comparison_service import compare_documents
 from .extraction_service import extract_structured
+from .faiss_index import (
+    build_document_index,
+    faiss_available,
+    get_index_stats,
+    remove_document_index,
+    search_document,
+    search_multi_document,
+)
 from .ingestion_service import document_to_chunks, ingest_document
 from .llm_service import chat_completion, get_llm_client
 from .metrics_service import get_metrics, LatencyTimer, record_request_end, record_request_start
@@ -32,4 +40,10 @@ __all__ = [
     "LatencyTimer",
     "record_request_start",
     "record_request_end",
+    "build_document_index",
+    "faiss_available",
+    "get_index_stats",
+    "remove_document_index",
+    "search_document",
+    "search_multi_document",
 ]

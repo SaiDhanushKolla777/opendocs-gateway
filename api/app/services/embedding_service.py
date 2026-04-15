@@ -77,7 +77,7 @@ def encode_query(query: str) -> np.ndarray:
 
 
 def embed_document_chunks(db: "Session", document_id: str) -> int:
-    """Compute and store embeddings for all chunks of a document (after ingest)."""
+    """Compute and store embeddings for all chunks of a document, then build FAISS index."""
     s = get_settings()
     if not s.rag_enabled or not embedding_available():
         return 0
@@ -91,10 +91,30 @@ def embed_document_chunks(db: "Session", document_id: str) -> int:
         logger.exception("Embedding failed for document %s: %s", document_id, e)
         return 0
     updates: List[Tuple[str, bytes]] = []
+    chunk_ids: List[str] = []
     for row, vec in zip(rows, embs):
         updates.append((row.id, embedding_to_bytes(vec)))
+        chunk_ids.append(row.id)
     update_chunk_embeddings_batch(db, updates)
+
+    _build_faiss_for_document(document_id, chunk_ids, embs)
+
     return len(updates)
+
+
+def _build_faiss_for_document(
+    document_id: str,
+    chunk_ids: List[str],
+    embeddings: np.ndarray,
+) -> None:
+    """Build a FAISS ANN index for this document (best-effort, non-blocking)."""
+    try:
+        from app.services.faiss_index import build_document_index, faiss_available
+        if not faiss_available():
+            return
+        build_document_index(document_id, chunk_ids, embeddings)
+    except Exception as e:
+        logger.warning("FAISS index build skipped for %s: %s", document_id, e)
 
 
 def semantic_similarity_scores(query: str, chunks: List["Chunk"]) -> List[float]:
@@ -113,7 +133,7 @@ def semantic_similarity_scores(query: str, chunks: List["Chunk"]) -> List[float]
 
 
 def ensure_chunk_embeddings(db: "Session", chunks: List["Chunk"]) -> None:
-    """Backfill missing embeddings in DB and attach bytes to Chunk objects."""
+    """Backfill missing embeddings in DB, attach bytes, and rebuild FAISS indexes."""
     s = get_settings()
     if not s.rag_enabled or not embedding_available():
         return
@@ -127,8 +147,20 @@ def ensure_chunk_embeddings(db: "Session", chunks: List["Chunk"]) -> None:
         logger.warning("Embedding backfill failed (TF-IDF only): %s", e)
         return
     updates: List[Tuple[str, bytes]] = []
+    affected_docs: set = set()
     for ch, vec in zip(missing, embs):
         blob = embedding_to_bytes(vec)
         updates.append((ch.chunk_id, blob))
         ch.embedding = blob
+        affected_docs.add(ch.document_id)
     update_chunk_embeddings_batch(db, updates)
+
+    for doc_id in affected_docs:
+        doc_chunks = [c for c in chunks if c.document_id == doc_id and c.embedding]
+        if doc_chunks:
+            ids = [c.chunk_id for c in doc_chunks]
+            vecs = np.array(
+                [bytes_to_embedding(c.embedding) for c in doc_chunks],
+                dtype=np.float32,
+            )
+            _build_faiss_for_document(doc_id, ids, vecs)

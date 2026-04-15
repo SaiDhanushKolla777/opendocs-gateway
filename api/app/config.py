@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     rag_tfidf_weight: float = Field(default=0.45, alias="RAG_TFIDF_WEIGHT")
     rrf_k: int = Field(default=60, alias="RRF_K")
 
+    # FAISS ANN index for corpus-scale semantic search
+    faiss_enabled: bool = Field(default=True, alias="FAISS_ENABLED")
+    faiss_index_dir: str = Field(default="./data/faiss_indexes", alias="FAISS_INDEX_DIR")
+    faiss_use_hnsw: bool = Field(default=True, alias="FAISS_USE_HNSW")
+    faiss_hnsw_m: int = Field(default=32, alias="FAISS_HNSW_M")
+    faiss_hnsw_ef_construction: int = Field(default=64, alias="FAISS_HNSW_EF_CONSTRUCTION")
+    faiss_hnsw_ef_search: int = Field(default=32, alias="FAISS_HNSW_EF_SEARCH")
+    faiss_nprobe: int = Field(default=8, alias="FAISS_NPROBE")
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
 

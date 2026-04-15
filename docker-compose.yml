@@ -23,6 +23,9 @@ services:
       - MAX_RETRIEVED_CHUNKS=${MAX_RETRIEVED_CHUNKS:-20}
       - MAX_CONTEXT_CHARS=${MAX_CONTEXT_CHARS:-32000}
       - MAX_ANSWER_TOKENS=${MAX_ANSWER_TOKENS:-1024}
+      - FAISS_ENABLED=${FAISS_ENABLED:-true}
+      - FAISS_INDEX_DIR=./data/faiss_indexes
+      - FAISS_USE_HNSW=${FAISS_USE_HNSW:-true}
     volumes:
       - opendocs_data:/app/data
     extra_hosts:

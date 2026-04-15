@@ -31,7 +31,7 @@ def ensure_dirs(s):
     from pathlib import Path
     Path(s.data_dir).mkdir(parents=True, exist_ok=True)
     Path(s.upload_dir).mkdir(parents=True, exist_ok=True)
-    # Ensure SQLite DB directory exists
+    Path(s.faiss_index_dir).mkdir(parents=True, exist_ok=True)
     if "sqlite" in s.database_url:
         db_path = s.database_url.replace("sqlite:///", "")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
